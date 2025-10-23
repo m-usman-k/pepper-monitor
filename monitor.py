@@ -117,13 +117,13 @@ class MonitorManager:
             description=deal.description or "",
         )
         if deal.price:
-            embed.add_field(name="Price", value=deal.price, inline=True)
+            embed.add_field(name="Cena", value=deal.price, inline=True)
         if deal.discount:
-            embed.add_field(name="Discount", value=deal.discount, inline=True)
+            embed.add_field(name="Rabat", value=deal.discount, inline=True)
         if deal.store:
-            embed.add_field(name="Store", value=deal.store, inline=True)
+            embed.add_field(name="Sklep", value=deal.store, inline=True)
         if deal.code:
-            embed.add_field(name="Code", value=f"`{deal.code}`", inline=False)
+            embed.add_field(name="Kod", value=f"`{deal.code}`", inline=False)
         if deal.image:
             embed.set_image(url=deal.image)
         embed.set_footer(text="pepper.pl monitor")
