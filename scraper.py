@@ -21,11 +21,13 @@ class Deal:
     url: str
     title: str
     price: Optional[str]
+    old_price: Optional[str]
     discount: Optional[str]
     store: Optional[str]
     image: Optional[str]
     code: Optional[str]
     description: Optional[str]
+    store_url: Optional[str]
 
 
 class PepperScraper:
@@ -42,16 +44,41 @@ class PepperScraper:
         if deal is None:
             return None
         # If key fields are missing (common on listing pages), enrich from detail page
-        if not (deal.image and deal.price and deal.store):
+        needs_enrich = not (getattr(deal, "image", None) and getattr(deal, "price", None) and getattr(deal, "store", None) and getattr(deal, "store_url", None))
+        if needs_enrich:
             detail = await self._fetch_detail_fields(deal.url)
             if detail:
                 deal.image = deal.image or detail.get("image")
                 deal.price = deal.price or detail.get("price")
+                deal.old_price = getattr(deal, "old_price", None) or detail.get("old_price")
                 deal.discount = deal.discount or detail.get("discount")
                 deal.store = deal.store or detail.get("store")
                 deal.code = deal.code or detail.get("code")
                 deal.description = deal.description or detail.get("description")
+                if detail.get("store_url"):
+                    deal.store_url = detail.get("store_url")
         return deal
+
+    async def _resolve_visit_link(self, visit_url: str) -> Optional[str]:
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        }
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+        proxy = await self.proxy_provider.get_proxy_url()
+        async with self._sem:
+            for attempt, use_proxy in enumerate([True, False]):
+                try:
+                    chosen_proxy = proxy if (use_proxy and proxy) else None
+                    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                        async with session.get(visit_url, proxy=chosen_proxy, ssl=False, allow_redirects=False) as resp:
+                            loc = resp.headers.get("Location")
+                            if loc:
+                                return self._normalize_url(loc)
+                except Exception:
+                    logger.exception("Visit resolve error for %s (attempt %d)", visit_url, attempt + 1)
+                    continue
+        return None
 
     def _normalize_url(self, url: str) -> str:
         if not url:
@@ -69,6 +96,24 @@ class PepperScraper:
         # Treat as relative path to Pepper base
         base = "https://www.pepper.pl/"
         return urljoin(base, u.lstrip('/'))
+
+    def _price_to_float(self, text: Optional[str]) -> Optional[float]:
+        if not text:
+            return None
+        t = str(text)
+        # Remove currency and spaces, unify decimal
+        t = t.replace('zł', '').replace('PLN', '').replace(' ', '').replace('\xa0', '')
+        t = t.replace(',', '.')
+        # Keep only digits and dot
+        import re as _re
+        m = _re.search(r"(\d+(?:\.\d+)?)", t)
+        return float(m.group(1)) if m else None
+
+    def _format_percent(self, old_v: Optional[float], new_v: Optional[float]) -> Optional[str]:
+        if not old_v or not new_v or old_v <= 0:
+            return None
+        pct = round((1.0 - (new_v / old_v)) * 100)
+        return f"-{int(pct)}%"
 
     async def _fetch_html(self, url: str) -> Optional[str]:
         # Use more realistic headers; Pepper sometimes tailors content by locale and UA
@@ -119,10 +164,24 @@ class PepperScraper:
         price_el = soup.select_one(".thread-price, span[class*='price'], [itemprop='price'], meta[itemprop='price'][content]")
         if price_el:
             data["price"] = price_el.get_text(strip=True) if price_el.name != "meta" else price_el.get("content")
+        # Old price (strikethrough)
+        old_el = soup.select_one(
+            ".thread-old-price, .price--old, .price-old, .text--del, del, s, .strikethrough, .was-price"
+        )
+        if old_el:
+            data["old_price"] = old_el.get_text(strip=True)
         # Discount
-        discount_el = soup.select_one(".badge--deal, span[class*='discount'], .thread-discount")
+        discount_el = soup.select_one(".badge--deal, span[class*='discount'], .thread-discount, .label--contrast--danger, .label--contrast")
         if discount_el:
             data["discount"] = discount_el.get_text(strip=True)
+        if not data.get("discount"):
+            import re as _re
+            for el in soup.select(".thread-price span, .thread-price div, span, .label, .badge"):
+                t = el.get_text(strip=True)
+                m = _re.search(r"-?\d{1,3}%", t or "")
+                if m:
+                    data["discount"] = m.group(0)
+                    break
         # Store
         store_el = soup.select_one(".cept-merchant-link, span[class*='merchant'], .thread-title--merchant")
         if store_el:
@@ -135,6 +194,14 @@ class PepperScraper:
         desc_el = soup.select_one(".userHtml-content, .cept-description-container, .thread--text, article p")
         if desc_el:
             data["description"] = desc_el.get_text(strip=True)
+        # Direct store link via pepper visit endpoint
+        visit_el = soup.select_one("a[href*='/visit/']")
+        if visit_el and visit_el.get("href"):
+            visit_url = self._normalize_url(visit_el.get("href"))
+            data["store_url"] = visit_url
+            resolved = await self._resolve_visit_link(visit_url)
+            if resolved:
+                data["store_url"] = resolved
         return data or None
 
     def _parse_latest(self, html: str) -> Optional[Deal]:
@@ -190,8 +257,21 @@ class PepperScraper:
         # Price and discount heuristics
         price_el = card.select_one("span[class*='price'], .thread-price, .threadListCard-price")
         price = price_el.get_text(strip=True) if price_el else None
-        discount_el = card.select_one("span[class*='discount'], .badge--deal")
+        old_price = None
+        discount_el = card.select_one("span[class*='discount'], .badge--deal, .label--contrast--danger, .label--contrast")
         discount = discount_el.get_text(strip=True) if discount_el else None
+        if not old_price:
+            old_el = card.select_one("del, s, .price--old, .thread-old-price, .text--del")
+            if old_el:
+                old_price = old_el.get_text(strip=True)
+        if not discount:
+            # Fallback: scan for a percentage token near price block
+            import re as _re
+            for el in card.select(".threadListCard-price span, .threadListCard-price div, span, .label, .badge"):
+                t = el.get_text(strip=True)
+                if t and _re.search(r"-?\d{1,3}%", t):
+                    discount = _re.search(r"-?\d{1,3}%", t).group(0)
+                    break
         store_el = card.select_one("span[class*='merchant'], .cept-merchant-link, .thread-title--merchant")
         store = store_el.get_text(strip=True) if store_el else None
         img_el = card.select_one("img[src]")
@@ -205,7 +285,10 @@ class PepperScraper:
         description = desc_el.get_text(strip=True) if desc_el else None
 
         # Attempt to enrich from data-vue3 JSON props in listing card
-        if any(v is None for v in (price, discount, store, image, code)):
+        store_url = None
+        next_best_price_str = None
+        price_discount_numeric = None
+        if any(v is None for v in (price, discount, store, image, code)) or True:
             import json
             for el in card.select('[data-vue3]'):
                 raw = el.get('data-vue3')
@@ -228,26 +311,74 @@ class PepperScraper:
                     store = store or thread.get('retailerName')
                     # price fields vary; try typical keys
                     price = price or thread.get('priceString') or thread.get('price') or thread.get('priceText')
-                    discount = discount or thread.get('discount') or thread.get('discountText')
+                    old_price = (
+                        old_price
+                        or thread.get('oldPriceString')
+                        or thread.get('oldPrice')
+                        or thread.get('previousPrice')
+                        or thread.get('priceBeforeString')
+                        or thread.get('priceBefore')
+                        or thread.get('strikethroughPrice')
+                    )
+                    # Next best/original price provided by listing
+                    next_best_price_str = (
+                        next_best_price_str
+                        or thread.get('displayNextBestPrice')
+                        or thread.get('nextBestPrice')
+                    )
+                    # Numeric discount value if present
+                    price_discount_numeric = price_discount_numeric or thread.get('priceDiscount')
+                    # Discount can be numeric or text
+                    discount = (
+                        discount
+                        or thread.get('discountText')
+                        or thread.get('discount')
+                        or thread.get('discountPercent')
+                        or thread.get('discountPercentage')
+                        or thread.get('savingsPercentage')
+                        or thread.get('percentOff')
+                    )
                     code = code or thread.get('voucherCode') or thread.get('code')
                 # Some components may provide explicit image props
                 img = props.get('image') if isinstance(props, dict) else None
                 if isinstance(img, dict):
                     image = image or img.get('src') or img.get('url')
+                # Main button component contains direct visit link
+                if obj.get('name') == 'ThreadListItemMainButton':
+                    link = props.get('link') if isinstance(props, dict) else None
+                    if link:
+                        store_url = self._normalize_url(link)
 
         if not href:
             return None
         # Prefer stable numeric id from href if available
         m = re.search(r"-(\d+)(?:[#/?].*)?$", href)
         unique_id = m.group(1) if m else href
+        # Compute missing old_price/discount from nextBestPrice and numeric discount
+        if not old_price and next_best_price_str:
+            old_price = next_best_price_str
+        if not discount:
+            # If we have price and old price, compute percentage
+            new_v = self._price_to_float(price)
+            old_v = self._price_to_float(old_price)
+            computed = self._format_percent(old_v, new_v)
+            if computed:
+                discount = computed
+            elif price_discount_numeric is not None:
+                try:
+                    discount = f"-{int(round(float(price_discount_numeric)))}%"
+                except Exception:
+                    pass
         return Deal(
             unique_id=unique_id,
             url=href,
             title=title,
             price=price,
+            old_price=old_price,
             discount=discount,
             store=store,
             image=image,
             code=code,
             description=description,
+            store_url=store_url,
         )

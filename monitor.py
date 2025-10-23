@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -69,6 +70,27 @@ class MonitorManager:
         total_monitors = sum(len(m) for m in monitors.values())
         return ListInfo(current_channel=channel_map, total_channels=total_channels, total_monitors=total_monitors)
 
+    async def formatted_monitor_lines(self) -> list[str]:
+        monitors = await self.storage.load_monitors()
+        lines: list[str] = []
+        for channel_id_str, mapping in monitors.items():
+            try:
+                cid = int(channel_id_str)
+            except Exception:
+                cid = None
+            channel = self.client.get_channel(cid) if cid else None
+            # Use a proper channel mention if available; otherwise, fallback to a readable placeholder
+            channel_tag = channel.mention if channel else f"#channel-{channel_id_str}"
+            for name, url in mapping.items():
+                # Normalize URLs: if it's a subpath (no scheme/host), prefix with the Pepper domain
+                disp_url = (url or "").strip()
+                if disp_url and not disp_url.lower().startswith(("http://", "https://")):
+                    disp_url = disp_url.lstrip("/")
+                    disp_url = f"https://www.pepper.pl/{disp_url}"
+                # Format: name, full url <channel-mention>
+                lines.append(f"{name}, {disp_url} {channel_tag}")
+        return lines
+
     async def _start_monitor(self, channel_id: int, name: str, url: str):
         key = (channel_id, name)
         if key in self._tasks:
@@ -110,21 +132,42 @@ class MonitorManager:
         if channel is None:
             logger.warning("Cannot send deal; channel %s not found", channel_id)
             return
+        url_for_embed = getattr(deal, "store_url", None) or deal.url
         embed = discord.Embed(
             title=deal.title or "New deal",
-            url=deal.url,
+            url=url_for_embed,
             color=EMBED_COLOR_HEX,
-            description=deal.description or "",
+            description="",
         )
-        if deal.price:
-            embed.add_field(name="Cena", value=deal.price, inline=True)
+        # Price displayed as old -> new when available
+        if getattr(deal, "old_price", None) and deal.price:
+            price_text = f"{deal.old_price} zł -> {deal.price} zł"
+        else:
+            price_text = f"{deal.price} zł" or ""
+        if price_text:
+            embed.add_field(name="Cena", value=price_text, inline=True)
         if deal.discount:
-            embed.add_field(name="Rabat", value=deal.discount, inline=True)
+            d = str(deal.discount).strip()
+            # Ensure it looks like '-26%'
+            if isinstance(d, str):
+                if '%' not in d:
+                    d = d + '%'
+                if not (d.startswith('-') or d.startswith('−') or d.startswith('+')):
+                    d = '-' + d
+            embed.add_field(name="Rabat", value=d, inline=True)
         if deal.store:
             embed.add_field(name="Sklep", value=deal.store, inline=True)
         if deal.code:
             embed.add_field(name="Kod", value=f"`{deal.code}`", inline=False)
         if deal.image:
             embed.set_image(url=deal.image)
-        embed.set_footer(text="pepper.pl monitor")
-        await channel.send(embed=embed)
+        guild = channel.guild
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        footer_name = f"{guild.name} • {now}" if guild else now
+        embed.set_footer(text=footer_name)
+        msg = await channel.send(embed=embed)
+        try:
+            await msg.add_reaction("✅")
+            await msg.add_reaction("❌")
+        except Exception:
+            pass

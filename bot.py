@@ -94,11 +94,9 @@ class AlertGroup(app_commands.Group):
         assert bot.monitor is not None
         await interaction.response.defer(ephemeral=True)
         data = await bot.monitor.list_monitors(channel_id=interaction.channel_id)
-        lines = []
-        for name, url in data.current_channel.items():
-            lines.append(f"• {name}: {url}")
-        desc = "\n".join(lines) if lines else "No monitors in this channel."
-        embed = discord.Embed(title="Current Channel Monitors", description=desc, color=EMBED_COLOR_HEX)
+        lines = await bot.monitor.formatted_monitor_lines()
+        desc = "\n".join(lines) if lines else "No monitors added."
+        embed = discord.Embed(title="Alert list", description=desc, color=EMBED_COLOR_HEX)
         embed.add_field(name="Total channels", value=str(data.total_channels))
         embed.add_field(name="Total monitors", value=str(data.total_monitors))
         await interaction.followup.send(embed=embed, ephemeral=True)
