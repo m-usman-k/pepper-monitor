@@ -35,6 +35,49 @@ class PepperScraper:
         self.proxy_provider = ProxyProvider()
         self._sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
+    def _build_image_from_main_image(self, main_image_obj: dict) -> Optional[str]:
+        try:
+            path = (main_image_obj.get("path") or "").strip("/")
+            name = main_image_obj.get("name")
+            ext = main_image_obj.get("ext") or "jpg"
+            if path and name and ext:
+                # Prefer resized format like: {path}/{name}/re/202x202/qt/70/{name}.ext
+                return self._normalize_url(f"https://static.pepper.pl/{path}/{name}/re/202x202/qt/70/{name}.{ext}")
+            uid = main_image_obj.get("uid")
+            if path and uid:
+                return self._normalize_url(f"https://static.pepper.pl/{path}/{uid}")
+        except Exception:
+            pass
+        return None
+
+    def _extract_image_from_props(self, props: dict, current: Optional[str]) -> Optional[str]:
+        image_url = current
+        if not isinstance(props, dict):
+            return image_url
+        # Prefer props.mainThread.mainImage
+        main_thread = props.get('mainThread')
+        if isinstance(main_thread, dict):
+            mt_img = main_thread.get('mainImage')
+            if isinstance(mt_img, dict):
+                candidate = self._build_image_from_main_image(mt_img)
+                if candidate and '/threads/' in candidate and '/event_promotions/' not in candidate:
+                    return candidate
+        # Fallback: props.thread.mainImage
+        thread = props.get('thread')
+        if isinstance(thread, dict):
+            t_img = thread.get('mainImage')
+            if isinstance(t_img, dict):
+                candidate = self._build_image_from_main_image(t_img)
+                if candidate and '/threads/' in candidate and '/event_promotions/' not in candidate:
+                    return candidate
+        # Fallback: top-level props.mainImage
+        main_img = props.get('mainImage')
+        if isinstance(main_img, dict):
+            candidate = self._build_image_from_main_image(main_img)
+            if candidate and '/threads/' in candidate and '/event_promotions/' not in candidate:
+                return candidate
+        return image_url
+
     async def fetch_latest(self, page_url: str) -> Optional[Deal]:
         url = self._normalize_url(page_url)
         html = await self._fetch_html(url)
@@ -58,6 +101,31 @@ class PepperScraper:
                 if detail.get("store_url"):
                     deal.store_url = detail.get("store_url")
         return deal
+
+    async def fetch_latest_batch(self, page_url: str, limit: int = 10) -> list[Deal]:
+        url = self._normalize_url(page_url)
+        html = await self._fetch_html(url)
+        if not html:
+            return []
+        deals = self._parse_cards(html, limit=limit)
+        # Enrich missing critical fields for each deal
+        enriched: list[Deal] = []
+        for d in deals:
+            needs_enrich = not (getattr(d, "image", None) and getattr(d, "price", None) and getattr(d, "store", None) and getattr(d, "store_url", None))
+            if needs_enrich:
+                detail = await self._fetch_detail_fields(d.url)
+                if detail:
+                    d.image = d.image or detail.get("image")
+                    d.price = d.price or detail.get("price")
+                    d.old_price = getattr(d, "old_price", None) or detail.get("old_price")
+                    d.discount = d.discount or detail.get("discount")
+                    d.store = d.store or detail.get("store")
+                    d.code = d.code or detail.get("code")
+                    d.description = d.description or detail.get("description")
+                    if detail.get("store_url"):
+                        d.store_url = detail.get("store_url")
+            enriched.append(d)
+        return enriched
 
     async def _resolve_visit_link(self, visit_url: str) -> Optional[str]:
         headers = {
@@ -155,9 +223,15 @@ class PepperScraper:
         og = soup.select_one("meta[property='og:image'][content]")
         if og and og.get("content"):
             data["image"] = self._normalize_url(og.get("content"))
-        img_el = soup.select_one("img[src]")
+        img_el = soup.select_one("img[src], img[data-src], source[srcset]")
         if not data.get("image") and img_el:
-            src = img_el.get("src")
+            src = None
+            if img_el.name == "source" and img_el.get("srcset"):
+                srcset = img_el.get("srcset")
+                # take the first url from srcset
+                src = (srcset or "").split(",")[0].strip().split(" ")[0]
+            else:
+                src = img_el.get("src") or img_el.get("data-src")
             if src:
                 data["image"] = self._normalize_url(src)
         # Price
@@ -274,10 +348,7 @@ class PepperScraper:
                     break
         store_el = card.select_one("span[class*='merchant'], .cept-merchant-link, .thread-title--merchant")
         store = store_el.get_text(strip=True) if store_el else None
-        img_el = card.select_one("img[src]")
-        image = img_el.get("src") if img_el else None
-        if image and not image.startswith("http"):
-            image = self._normalize_url(image)
+        image = None
         # Promo code often appears as code tag or span with 'code'
         code_el = card.select_one("code, .voucher-code, span[class*='code']")
         code = code_el.get_text(strip=True) if code_el else None
@@ -290,7 +361,9 @@ class PepperScraper:
         price_discount_numeric = None
         if any(v is None for v in (price, discount, store, image, code)) or True:
             import json
-            for el in card.select('[data-vue3]'):
+            child = card.find('div', attrs={'data-vue3': True}, recursive=False)
+            elements = [child] if child else card.select('[data-vue3]')
+            for el in elements:
                 raw = el.get('data-vue3')
                 if not raw:
                     continue
@@ -339,10 +412,8 @@ class PepperScraper:
                         or thread.get('percentOff')
                     )
                     code = code or thread.get('voucherCode') or thread.get('code')
-                # Some components may provide explicit image props
-                img = props.get('image') if isinstance(props, dict) else None
-                if isinstance(img, dict):
-                    image = image or img.get('src') or img.get('url')
+                # Prefer mainImage from props
+                image = self._extract_image_from_props(props, image)
                 # Main button component contains direct visit link
                 if obj.get('name') == 'ThreadListItemMainButton':
                     link = props.get('link') if isinstance(props, dict) else None
@@ -382,3 +453,141 @@ class PepperScraper:
             description=description,
             store_url=store_url,
         )
+
+    def _parse_cards(self, html: str, limit: int = 10) -> list[Deal]:
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except bs4.FeatureNotFound:
+            soup = BeautifulSoup(html, "html.parser")
+        cards = soup.select("article.thread[id^='thread_'], article.thread, article[data-thread-id], article[data-t], div.thread, article")
+        results: list[Deal] = []
+        for card in cards:
+            try:
+                link_el = (
+                    card.select_one("a.thread-link[href]")
+                    or card.select_one("strong.thread-title a[href]")
+                    or card.select_one("a[href]")
+                )
+                href = link_el.get("href") if link_el else None
+                if not href:
+                    continue
+                title_el = (
+                    card.select_one("strong.thread-title a")
+                    or card.select_one("h2, h3")
+                    or link_el
+                )
+                title = title_el.get_text(strip=True) if title_el else "New deal"
+                price_el = card.select_one("span[class*='price'], .thread-price, .threadListCard-price")
+                price = price_el.get_text(strip=True) if price_el else None
+                old_price = None
+                discount_el = card.select_one("span[class*='discount'], .badge--deal, .label--contrast--danger, .label--contrast")
+                discount = discount_el.get_text(strip=True) if discount_el else None
+                if not old_price:
+                    old_el = card.select_one("del, s, .price--old, .thread-old-price, .text--del")
+                    if old_el:
+                        old_price = old_el.get_text(strip=True)
+                if not discount:
+                    import re as _re
+                    for el in card.select(".threadListCard-price span, .threadListCard-price div, span, .label, .badge"):
+                        t = el.get_text(strip=True)
+                        if t and _re.search(r"-?\d{1,3}%", t):
+                            discount = _re.search(r"-?\d{1,3}%", t).group(0)
+                            break
+                store_el = card.select_one("span[class*='merchant'], .cept-merchant-link, .thread-title--merchant")
+                store = store_el.get_text(strip=True) if store_el else None
+                image = None
+                code_el = card.select_one("code, .voucher-code, span[class*='code']")
+                code = code_el.get_text(strip=True) if code_el else None
+                desc_el = card.select_one(".userHtml-content, .cept-description-container, p, .thread--text")
+                description = desc_el.get_text(strip=True) if desc_el else None
+                # Try to read data-vue3 for store_url and additional fields
+                store_url = None
+                next_best_price_str = None
+                price_discount_numeric = None
+                import json
+                child = card.find('div', attrs={'data-vue3': True}, recursive=False)
+                data_vue_elems = [child] if child else card.select('[data-vue3]')
+                for el in data_vue_elems:
+                    raw = el.get('data-vue3')
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        continue
+                    props = obj.get('props') or {}
+                    thread = props.get('thread') or {}
+                    if thread:
+                        merchant_val = thread.get('merchant') or thread.get('merchantInfo') or props.get('merchant')
+                        if isinstance(merchant_val, dict):
+                            store = store or merchant_val.get('merchantName') or merchant_val.get('name') or merchant_val.get('merchantUrlName')
+                        elif isinstance(merchant_val, str):
+                            store = store or merchant_val
+                        store = store or thread.get('retailerName')
+                        price = price or thread.get('priceString') or thread.get('price') or thread.get('priceText')
+                        old_price = (
+                            old_price
+                            or thread.get('oldPriceString')
+                            or thread.get('oldPrice')
+                            or thread.get('previousPrice')
+                            or thread.get('priceBeforeString')
+                            or thread.get('priceBefore')
+                            or thread.get('strikethroughPrice')
+                        )
+                        next_best_price_str = (
+                            next_best_price_str
+                            or thread.get('displayNextBestPrice')
+                            or thread.get('nextBestPrice')
+                        )
+                        price_discount_numeric = price_discount_numeric or thread.get('priceDiscount')
+                        discount = (
+                            discount
+                            or thread.get('discountText')
+                            or thread.get('discount')
+                            or thread.get('discountPercent')
+                            or thread.get('discountPercentage')
+                            or thread.get('savingsPercentage')
+                            or thread.get('percentOff')
+                        )
+                        code = code or thread.get('voucherCode') or thread.get('code')
+                    # Prefer mainImage from props
+                    image = self._extract_image_from_props(props, image)
+                    # Main button link
+                    if obj.get('name') == 'ThreadListItemMainButton':
+                        link = props.get('link') if isinstance(props, dict) else None
+                        if link:
+                            store_url = self._normalize_url(link)
+                href = href
+                m = re.search(r"-(\d+)(?:[#/?].*)?$", href)
+                unique_id = m.group(1) if m else href
+                if not old_price and next_best_price_str:
+                    old_price = next_best_price_str
+                if not discount:
+                    new_v = self._price_to_float(price)
+                    old_v = self._price_to_float(old_price)
+                    computed = self._format_percent(old_v, new_v)
+                    if computed:
+                        discount = computed
+                    elif price_discount_numeric is not None:
+                        try:
+                            discount = f"-{int(round(float(price_discount_numeric)))}%"
+                        except Exception:
+                            pass
+                results.append(Deal(
+                    unique_id=unique_id,
+                    url=href,
+                    title=title,
+                    price=price,
+                    old_price=old_price,
+                    discount=discount,
+                    store=store,
+                    image=image,
+                    code=code,
+                    description=description,
+                    store_url=store_url,
+                ))
+                if len(results) >= limit:
+                    break
+            except Exception:
+                continue
+        return results

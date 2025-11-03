@@ -108,17 +108,20 @@ class MonitorManager:
         while True:
             try:
                 async with lock:
-                    latest = await self.scraper.fetch_latest(url)
-                if latest is None:
+                    # Fetch a batch to avoid skipping cards when multiple are posted quickly
+                    deals = await self.scraper.fetch_latest_batch(url)
+                if not deals:
                     await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
                     continue
-                deal_id = latest.unique_id
-                seen_key = f"{channel_id}:{url}:{deal_id}"
-                async with self._io_lock:
-                    already = await self.storage.is_seen(seen_key)
-                    if not already:
-                        await self._send_deal(channel_id, latest)
-                        await self.storage.mark_seen(seen_key)
+                # Send unseen in chronological order (oldest first)
+                for d in reversed(deals):
+                    deal_id = d.unique_id
+                    seen_key = f"{channel_id}:{url}:{deal_id}"
+                    async with self._io_lock:
+                        already = await self.storage.is_seen(seen_key)
+                        if not already:
+                            await self._send_deal(channel_id, d)
+                            await self.storage.mark_seen(seen_key)
             except asyncio.CancelledError:
                 logger.info("Monitor cancelled: %s - %s", channel_id, name)
                 break
@@ -159,7 +162,15 @@ class MonitorManager:
             embed.add_field(name="Sklep", value=deal.store, inline=True)
         if deal.code:
             embed.add_field(name="Kod", value=f"`{deal.code}`", inline=False)
+
+        print(deal.image)
         if deal.image:
+            # Debug print for image URL used in embed
+            try:
+                print(f"[pepper-monitor] embed image url -> {deal.image}")
+            except Exception:
+                pass
+            logger.info("Embed image URL set: %s", deal.image)
             embed.set_image(url=deal.image)
         guild = channel.guild
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
